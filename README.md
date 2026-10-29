@@ -8,7 +8,7 @@ Collaborative board (rectangles + freehand lines) served by 3 equal nodes. Any c
 docker compose up --build          # node1:8001, node2:8002, node3:8003
 ```
 
-The nodes use host networking (Linux, e.g. Hetzner). On Docker Desktop for Mac/Windows, enable host networking in Settings → Resources → Network first.
+The nodes use host networking (Linux, e.g. Hetzner). If the host firewall `ufw` is active, allow the ports first: `sudo ufw allow 8001:8003/tcp`. Docker-published ports bypass ufw, host-networked ones do not. On Docker Desktop for Mac/Windows, enable host networking in Settings → Resources → Network.
 
 Open http://localhost:8001, http://localhost:8002, http://localhost:8003 in different tabs. Drawing in one tab shows up in all of them.
 
