@@ -59,6 +59,7 @@ A shape shows up only after its `create_shape` has arrived.
    (volume data1)          (volume data2)          (volume data3)
 ```
 
+- **Internal replication ports:** nodes talk to each other on ports 9001-9003 (`/peer`), which are only reachable inside the Docker network and are not published to the host. Clients can only reach 8001-8003, and every replicated message is validated before it is applied.
 - **Op flow:** a client sends an op to its node. The node gives it `ts=[hlc, originId]` and a per-origin seq, applies it, appends it to `ops.log`, broadcasts it to its clients and pushes it to its peers right away. Peers apply it and broadcast it to their own clients.
 - **State:** each shape position is an LWW register keyed by `ts`. Lines are a grow-only set keyed by id. Ops are deduplicated by `opId`.
 - **Anti-entropy:** every 500 ms nodes swap version vectors (`origin → max seq`) and send each other the missing ops for every origin. This includes ops from origins that are offline right now, so any surviving node can repair any other node.

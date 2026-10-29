@@ -13,6 +13,9 @@ const { WebSocketServer, WebSocket } = require('ws');
 
 const NODE_ID = process.env.NODE_ID || 'node1';
 const PORT = Number(process.env.PORT || 8001);
+// Replication runs on a separate port that docker-compose does not publish,
+// so only nodes on the internal Docker network can act as peers.
+const PEER_PORT = Number(process.env.PEER_PORT || PORT + 1000);
 const PEERS = (process.env.PEERS || '').split(',').map(s => s.trim()).filter(Boolean);
 const DATA_DIR = process.env.DATA_DIR || '/data';
 const LOG_FILE = path.join(DATA_DIR, 'ops.log');
@@ -169,6 +172,23 @@ function publishLocal(op, str) {
 }
 
 function onClientMessage(ws, data) {
+  try { handleClientMessage(ws, data); } catch (e) { console.error('bad client message', e.message); }
+}
+
+// Rebuilds a preview from validated fields so nothing else is relayed.
+function cleanPreview(m) {
+  const p = { type: 'preview', kind: m.kind === 'rect' ? 'rect' : 'line', id: String(m.id).slice(0, 128), color: String(m.color || '#222').slice(0, 32) };
+  if (p.kind === 'line') {
+    p.from = Math.max(0, Math.floor(num(m.from)));
+    p.width = num(m.width, 2);
+    p.points = (Array.isArray(m.points) ? m.points.slice(0, 5000) : []).map(q => (Array.isArray(q) ? [num(q[0]), num(q[1])] : [0, 0]));
+  } else {
+    p.x = num(m.x); p.y = num(m.y); p.w = num(m.w); p.h = num(m.h);
+  }
+  return JSON.stringify(p);
+}
+
+function handleClientMessage(ws, data) {
   let m;
   try { m = JSON.parse(data); } catch { return; }
   if (m && (m.type === 'get_state' || m.type === 'snapshot')) {
@@ -177,7 +197,7 @@ function onClientMessage(ws, data) {
   }
   // Live drawing preview: relayed to everyone, never stored (not part of /state).
   if (m && m.type === 'preview') {
-    const str = data.toString();
+    const str = cleanPreview(m);
     for (const c of clients) if (c !== ws && c.readyState === WebSocket.OPEN) c.send(str);
     for (const p of peers) if (p.outgoing && p.readyState === WebSocket.OPEN) p.send('{"t":"preview","m":' + str + '}');
     return;
@@ -205,19 +225,29 @@ function sendMissing(ws, theirVv) {
   if (out.length && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: 'ops', ops: out }));
 }
 
+const OP_TYPES = new Set(['create_shape', 'move_shape', 'draw_line', 'clear_board']);
+function validOp(op) {
+  return !!op && typeof op === 'object' && OP_TYPES.has(op.type) && typeof op.origin === 'string' && Number.isInteger(op.seq)
+    && typeof op.opId === 'string' && typeof op.id === 'string' && Array.isArray(op.ts) && op.ts.length === 2
+    && Number.isFinite(op.ts[0]) && typeof op.ts[1] === 'string';
+}
+
 function onPeerMessage(ws, data) {
   ws.lastSeen = Date.now();
   let m;
   try { m = JSON.parse(data); } catch { return; }
-  if (m.t === 'preview') {
-    sendAll(clients, JSON.stringify(m.m));
-  } else if (m.t === 'vv') {
-    sendMissing(ws, m.vv || {});
-  } else if (m.t === 'ops') {
-    for (const op of m.ops) {
-      if (ingest(op)) publishLocal(op, JSON.stringify(op));
+  if (!m || typeof m !== 'object') return;
+  try {
+    if (m.t === 'preview') {
+      if (m.m && typeof m.m === 'object') sendAll(clients, cleanPreview(m.m));
+    } else if (m.t === 'vv') {
+      sendMissing(ws, m.vv && typeof m.vv === 'object' ? m.vv : {});
+    } else if (m.t === 'ops' && Array.isArray(m.ops)) {
+      for (const op of m.ops) {
+        if (validOp(op) && ingest(op)) publishLocal(op, JSON.stringify(op));
+      }
     }
-  }
+  } catch (e) { console.error('bad peer message', e.message); }
 }
 
 function setupPeer(ws) {
@@ -268,22 +298,22 @@ const server = http.createServer((req, res) => {
   }
 });
 
-const wssClients = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 64 * 1024 * 1024 });
+const wssClients = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 4 * 1024 * 1024 });
 const wssPeers = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 512 * 1024 * 1024 });
 
 server.on('upgrade', (req, socket, head) => {
-  const url = req.url.split('?')[0];
-  if (url === '/peer') {
-    wssPeers.handleUpgrade(req, socket, head, ws => setupPeer(ws));
-  } else {
-    wssClients.handleUpgrade(req, socket, head, ws => {
-      clients.add(ws);
-      ws.on('message', d => onClientMessage(ws, d));
-      ws.on('close', () => clients.delete(ws));
-      ws.on('error', () => {});
-      ws.send(JSON.stringify({ type: 'snapshot', state: snapshot() }));
-    });
-  }
+  wssClients.handleUpgrade(req, socket, head, ws => {
+    clients.add(ws);
+    ws.on('message', d => onClientMessage(ws, d));
+    ws.on('close', () => clients.delete(ws));
+    ws.on('error', () => {});
+    ws.send(JSON.stringify({ type: 'snapshot', state: snapshot() }));
+  });
+});
+
+const peerServer = http.createServer((req, res) => { res.writeHead(404); res.end(); });
+peerServer.on('upgrade', (req, socket, head) => {
+  wssPeers.handleUpgrade(req, socket, head, ws => setupPeer(ws));
 });
 
 function shutdown() {
@@ -296,7 +326,8 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 loadLog();
+peerServer.listen(PEER_PORT);
 server.listen(PORT, () => {
-  console.log(`[${NODE_ID}] origin=${ORIGIN} listening on ${PORT}, peers=${PEERS.join(',')}`);
+  console.log(`[${NODE_ID}] origin=${ORIGIN} listening on ${PORT} (peers on ${PEER_PORT}), peers=${PEERS.join(',')}`);
   PEERS.forEach(dialPeer);
 });
