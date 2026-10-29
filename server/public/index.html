@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whiteboard</title>
+<style>
+  :root { --bg: #ffffff; --glass: rgba(255,255,255,.72); --line: rgba(15,18,30,.08); --text: #14151a; --muted: #6b7085; --accent: #7c5cff; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+               font: 13px/1.2 ui-sans-serif, -apple-system, "SF Pro Text", Inter, system-ui, sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; touch-action: none; display: block; cursor: crosshair; }
+  .glass { background: var(--glass); border: 1px solid var(--line); backdrop-filter: blur(18px) saturate(160%); -webkit-backdrop-filter: blur(18px) saturate(160%);
+           box-shadow: 0 10px 40px rgba(20,22,40,.12), 0 1px 3px rgba(20,22,40,.06); }
+  #bar { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 2; display: flex; gap: 8px; align-items: center;
+         border-radius: 18px; padding: 8px; flex-wrap: wrap; justify-content: center; max-width: calc(100vw - 32px); }
+  #bar button { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent; color: var(--muted);
+                border-radius: 12px; padding: 8px 12px; cursor: pointer; font: inherit; font-weight: 600; transition: all .15s ease; }
+  #bar button:hover { color: var(--text); background: rgba(15,18,30,.05); }
+  #bar button.on { color: #fff; background: linear-gradient(135deg, #7c5cff, #ff5cae); box-shadow: 0 4px 18px rgba(124,92,255,.45); }
+  #bar svg { width: 16px; height: 16px; }
+  .sep { width: 1px; height: 24px; background: var(--line); margin: 0 2px; }
+  #bar #tClear:hover { color: #e5484d; background: rgba(229,72,77,.08); }
+  .sw { width: 22px; height: 22px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; transition: transform .15s ease; }
+  .sw:hover { transform: scale(1.15); }
+  .sw.on { border-color: #fff; box-shadow: 0 0 0 2px currentColor, 0 0 12px currentColor; }
+  #bar input[type=color] { width: 24px; height: 24px; border: none; padding: 0; background: none; cursor: pointer; border-radius: 50%; }
+  #top { position: fixed; top: 16px; left: 16px; right: 16px; z-index: 2; display: flex; justify-content: space-between; align-items: center; pointer-events: none; gap: 8px; flex-wrap: wrap; }
+  #top > * { pointer-events: auto; }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 8px 14px 8px 10px; border-radius: 14px; font-weight: 700; letter-spacing: -.01em; }
+  .logo { width: 22px; height: 22px; border-radius: 7px; background: conic-gradient(from 180deg, #7c5cff, #ff5cae, #ffb35c, #5cffc8, #7c5cff); }
+  .meta { display: flex; align-items: center; gap: 8px; padding: 6px; border-radius: 14px; }
+  .chip { padding: 6px 10px; border-radius: 10px; font-size: 12px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .chip.on { color: #fff; background: #12b886; box-shadow: 0 4px 14px rgba(18,184,134,.4); }
+  #status { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; font-size: 12px; font-weight: 600; color: #e5484d; }
+  #status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 10px currentColor; animation: pulse 1.4s ease-in-out infinite; }
+  #status.ok { color: #12b886; }
+  @keyframes pulse { 50% { opacity: .35; transform: scale(.8); } }
+  #counts { font-size: 12px; color: var(--muted); padding: 0 8px; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="top">
+  <div class="brand glass"><span class="logo"></span>Realtime Board</div>
+  <div class="meta glass">
+    <span id="status">connecting…</span>
+    <span class="chip" data-port="8001">8001</span><span class="chip" data-port="8002">8002</span><span class="chip" data-port="8003">8003</span>
+    <span id="counts"></span>
+  </div>
+</div>
+<div id="bar" class="glass">
+  <button id="tLine" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 17c3-6 6 2 9-4s6-6 9-2"/></svg>Draw</button>
+  <button id="tRect"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="5" width="16" height="14" rx="3"/></svg>Shape</button>
+  <span class="sep"></span>
+  <span class="sw on" style="background:#7c5cff;color:#7c5cff" data-c="#7c5cff"></span>
+  <span class="sw" style="background:#ff5cae;color:#ff5cae" data-c="#ff5cae"></span>
+  <span class="sw" style="background:#ffb35c;color:#ffb35c" data-c="#ffb35c"></span>
+  <span class="sw" style="background:#5cffc8;color:#5cffc8" data-c="#5cffc8"></span>
+  <span class="sw" style="background:#5cb8ff;color:#5cb8ff" data-c="#5cb8ff"></span>
+  <span class="sw" style="background:#1d1f27;color:#1d1f27" data-c="#1d1f27"></span>
+  <input type="color" id="color" value="#7c5cff" title="Custom color">
+  <span class="sep"></span>
+  <button id="tClear" title="Clear the board for everyone"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/></svg>Clear</button>
+</div>
+<canvas id="cv"></canvas>
+<script>
+(() => {
+  'use strict';
+  const PORTS = [8001, 8002, 8003];
+  // desynchronized: low-latency canvas that presents without waiting for the compositor.
+  const cv = document.getElementById('cv'), ctx = cv.getContext('2d', { desynchronized: true });
+  const statusEl = document.getElementById('status'), countsEl = document.getElementById('counts');
+  const colorEl = document.getElementById('color');
+
+  // ---------- ids ----------
+  const uuid = () => (crypto && crypto.randomUUID) ? crypto.randomUUID()
+    : 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  const rid = (p) => p + '-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+
+  // ---------- state ----------
+  const shapes = new Map();   // id -> {id,x,y,w,h,color,ts,created}
+  const lines = new Map();    // id -> {id,points,color,width,ts}
+  const pending = new Map();  // opId -> msg
+  const previews = new Map(); // id -> {kind, points | x,y,w,h, color, width, t}  (others' in-progress drawing)
+  let sortedLines = null;
+  const ZERO = [-Infinity, ''];
+  const compareTs = (a, b) => (a[0] - b[0]) || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0);
+  const newer = (ts, cur) => !cur || compareTs(ts, cur) > 0;
+
+  function applyPreview(m) {
+    if (lines.has(m.id) || shapes.has(m.id)) return; // final op already arrived; ignore late preview
+    let p = previews.get(m.id);
+    if (!p) previews.set(m.id, p = { kind: m.kind, points: [] });
+    p.t = performance.now(); p.color = m.color; p.width = m.width;
+    if (m.kind === 'line') {
+      const from = m.from || 0;
+      p.points.splice(from, Infinity, ...(m.points || []));
+      // Paint the new segment right now instead of waiting for the next animation frame.
+      drawStroke(p.points.slice(Math.max(0, from - 1)), p.color, p.width);
+    } else { p.x = m.x; p.y = m.y; p.w = m.w; p.h = m.h; }
+  }
+
+  let clearedAt = null; // ts of latest clear_board: everything created before it is hidden
+
+  function applyOp(m) {
+    const ts = m.ts || [0, ''];
+    previews.delete(m.id);
+    if ((m.type === 'create_shape' || m.type === 'draw_line') && clearedAt && !newer(ts, clearedAt)) return;
+    if (m.type === 'clear_board') {
+      if (!newer(ts, clearedAt)) return;
+      clearedAt = ts;
+      for (const [id, s] of shapes) if (s.created && !newer(s.cts || s.ts || ZERO, ts)) shapes.delete(id);
+      for (const [id, l] of lines) if (!newer(l.ts, ts)) lines.delete(id);
+      previews.clear(); sortedLines = null;
+      // Ask for the authoritative view so concurrent edge cases match the server exactly.
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send('{"type":"get_state"}');
+      return;
+    }
+    if (m.type === 'create_shape') {
+      const s = shapes.get(m.id) || { id: m.id, x: m.x, y: m.y, ts: null, created: false };
+      s.w = m.w; s.h = m.h; s.color = m.color; s.created = true;
+      if (newer(ts, s.cts)) s.cts = ts;
+      if (newer(ts, s.ts)) { s.x = m.x; s.y = m.y; s.ts = ts; }
+      shapes.set(m.id, s);
+    } else if (m.type === 'move_shape') {
+      let s = shapes.get(m.id);
+      if (!s) { s = { id: m.id, x: m.x, y: m.y, w: 0, h: 0, color: '#000', ts: null, created: false }; shapes.set(m.id, s); }
+      if (newer(ts, s.ts)) { s.x = m.x; s.y = m.y; s.ts = ts; }
+    } else if (m.type === 'draw_line') {
+      if (!lines.has(m.id)) { lines.set(m.id, { id: m.id, points: m.points, color: m.color, width: m.width, ts }); sortedLines = null; }
+    }
+  }
+
+  function applySnapshot(st) {
+    shapes.clear(); lines.clear(); sortedLines = null;
+    clearedAt = st.clearedAt || null;
+    for (const s of (st.shapes || [])) shapes.set(s.id, { id: s.id, x: s.x, y: s.y, w: s.w, h: s.h, color: s.color, ts: s.ts, created: true });
+    for (const l of (st.lines || [])) lines.set(l.id, { id: l.id, points: l.points, color: l.color, width: l.width, ts: l.ts });
+    // Drop pending ops whose effect is already visible in the snapshot (server may dedup silently).
+    for (const [opId, m] of pending) {
+      if (m.type === 'create_shape' && shapes.has(m.id) && shapes.get(m.id).created) pending.delete(opId);
+      else if (m.type === 'draw_line' && lines.has(m.id)) pending.delete(opId);
+      else if (m.type === 'move_shape') { const s = shapes.get(m.id); if (s && s.x === m.x && s.y === m.y) pending.delete(opId); }
+    }
+  }
+
+  // ---------- networking ----------
+  let idx = Math.max(0, PORTS.indexOf(Number(location.port)));
+  let ws = null, ready = false, backoff = 200, port = null;
+
+  function connect() {
+    port = PORTS[idx];
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const sock = new WebSocket(`${proto}://${location.hostname || 'localhost'}:${port}/`);
+    ws = sock; ready = false; let dead = false;
+    setStatus();
+    sock.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === 'snapshot') {
+        applySnapshot(m.state || {});
+        ready = true; backoff = 200; setStatus();
+        for (const msg of pending.values()) sock.send(JSON.stringify(msg));
+      } else if (m.type === 'preview') {
+        applyPreview(m);
+      } else if (ready) {
+        if (m.opId) pending.delete(m.opId);
+        applyOp(m);
+      }
+      dirty = true;
+    };
+    const down = () => {
+      if (dead) return; dead = true;
+      if (ws === sock) { ready = false; ws = null; }
+      setStatus();
+      idx = (idx + 1) % PORTS.length;
+      setTimeout(connect, backoff);
+      backoff = Math.min(1000, backoff * 2);
+    };
+    sock.onclose = down;
+    sock.onerror = () => { try { sock.close(); } catch {} down(); };
+  }
+
+  function send(msg) {
+    pending.set(msg.opId, msg);
+    if (ws && ready && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify(msg)); } catch {}
+    }
+    dirty = true;
+  }
+
+  // Previews are fire-and-forget: not queued, not resent.
+  function sendPreview(msg) {
+    if (ws && ready && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify(msg)); } catch {}
+    }
+  }
+
+  function setStatus() {
+    if (ws && ready) { statusEl.textContent = 'live'; statusEl.className = 'ok'; }
+    else { statusEl.textContent = 'reconnecting'; statusEl.className = ''; }
+    for (const c of document.querySelectorAll('.chip')) c.classList.toggle('on', ws && ready && Number(c.dataset.port) === port);
+  }
+
+  // ---------- view model (server state + optimistic overlay) ----------
+  let dragging = null;   // {id, dx, dy, x, y, lastSent}
+  let settle = null;     // {id, opId, x, y} keep local pos after mouseup until final echo
+  let creating = null;   // {x0,y0,x1,y1}
+  let stroke = null;     // [[x,y],...]
+  let liveId = null, liveSent = 0, liveAt = 0; // id + preview progress of the stroke/rect being drawn
+  function streamPreview(force) {
+    if (!force && performance.now() - liveAt < 4) return;
+    liveAt = performance.now();
+    if (stroke) {
+      if (stroke.length <= liveSent) return;
+      sendPreview({ type: 'preview', kind: 'line', id: liveId, from: liveSent, points: stroke.slice(liveSent), color: colorEl.value, width: 2 });
+      liveSent = stroke.length;
+    } else if (creating) {
+      sendPreview({ type: 'preview', kind: 'rect', id: liveId, ...norm(creating), color: colorEl.value });
+    }
+  }
+
+  function displayShapes() {
+    const out = [], seen = new Set();
+    for (const s of shapes.values()) if (s.created) { out.push({ ...s }); seen.add(s.id); }
+    for (const m of pending.values()) {
+      if (m.type === 'create_shape' && !seen.has(m.id)) { out.push({ id: m.id, x: m.x, y: m.y, w: m.w, h: m.h, color: m.color }); seen.add(m.id); }
+    }
+    if (settle && !pending.has(settle.opId)) settle = null;
+    for (const s of out) {
+      if (dragging && s.id === dragging.id) { s.x = dragging.x; s.y = dragging.y; }
+      else if (settle && s.id === settle.id) { s.x = settle.x; s.y = settle.y; }
+    }
+    return out;
+  }
+
+  function displayLines() {
+    if (!sortedLines) sortedLines = [...lines.values()].sort((a, b) => compareTs(a.ts || ZERO, b.ts || ZERO));
+    const extra = [];
+    for (const m of pending.values()) if (m.type === 'draw_line' && !lines.has(m.id)) extra.push(m);
+    return extra.length ? sortedLines.concat(extra) : sortedLines;
+  }
+
+  // ---------- rendering ----------
+  let dirty = true, dpr = 1;
+  const dotPattern = (() => {
+    const c = document.createElement('canvas'); c.width = c.height = 24;
+    const g = c.getContext('2d'); g.fillStyle = 'rgba(15,18,30,.13)'; g.beginPath(); g.arc(12, 12, 1.1, 0, Math.PI * 2); g.fill();
+    return ctx.createPattern(c, 'repeat');
+  })();
+  for (const sw of document.querySelectorAll('.sw')) sw.onclick = () => {
+    colorEl.value = sw.dataset.c;
+    for (const o of document.querySelectorAll('.sw')) o.classList.toggle('on', o === sw);
+  };
+  function resize() {
+    dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(innerWidth * dpr); cv.height = Math.round(innerHeight * dpr);
+    dirty = true;
+  }
+  addEventListener('resize', resize); resize();
+
+  function drawStroke(pts, color, width) {
+    if (!pts || pts.length < 1) return;
+    ctx.strokeStyle = color; ctx.lineWidth = width || 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    if (pts.length === 1) ctx.lineTo(pts[0][0] + 0.1, pts[0][1]);
+    ctx.stroke();
+  }
+
+  function render() {
+    if (dirty) {
+      dirty = false;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, innerWidth, innerHeight);
+      ctx.fillStyle = dotPattern; ctx.fillRect(0, 0, innerWidth, innerHeight);
+      const ls = displayLines(), ss = displayShapes();
+      for (const s of ss) {
+        const active = dragging && s.id === dragging.id;
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(s.x, s.y, s.w, s.h, Math.min(12, s.w / 4, s.h / 4)); else ctx.rect(s.x, s.y, s.w, s.h);
+        if (active) { ctx.shadowColor = s.color; ctx.shadowBlur = 28; }
+        ctx.globalAlpha = .2; ctx.fillStyle = s.color; ctx.fill();
+        ctx.globalAlpha = 1; ctx.strokeStyle = s.color; ctx.lineWidth = active ? 2.5 : 1.5; ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+      for (const l of ls) drawStroke(l.points, l.color, l.width);
+      const now = performance.now();
+      for (const [id, p] of previews) {
+        if (now - p.t > 3000) { previews.delete(id); continue; }
+        if (p.kind === 'line') drawStroke(p.points, p.color, p.width);
+        else {
+          ctx.setLineDash([5, 4]); ctx.strokeStyle = p.color; ctx.lineWidth = 1.5;
+          ctx.strokeRect(p.x, p.y, p.w, p.h); ctx.setLineDash([]);
+        }
+      }
+      if (previews.size) dirty = true;
+      if (stroke) { ctx.shadowColor = colorEl.value; ctx.shadowBlur = 14; drawStroke(stroke, colorEl.value, 2.5); ctx.shadowBlur = 0; }
+      if (creating) {
+        const r = norm(creating);
+        ctx.setLineDash([5, 4]); ctx.strokeStyle = colorEl.value; ctx.lineWidth = 1.5;
+        ctx.strokeRect(r.x, r.y, r.w, r.h); ctx.setLineDash([]);
+      }
+      countsEl.textContent = `${ss.length} shapes · ${ls.length} lines` + (pending.size ? ` · ${pending.size} pending` : '');
+    }
+    requestAnimationFrame(render);
+  }
+  requestAnimationFrame(render);
+
+  // ---------- input ----------
+  let tool = 'line';
+  const tLine = document.getElementById('tLine'), tRect = document.getElementById('tRect');
+  tLine.onclick = () => { tool = 'line'; tLine.classList.add('on'); tRect.classList.remove('on'); };
+  tRect.onclick = () => { tool = 'rect'; tRect.classList.add('on'); tLine.classList.remove('on'); };
+  document.getElementById('tClear').onclick = () => {
+    if (confirm('Clear the board for everyone?')) send({ type: 'clear_board', opId: uuid(), id: 'board' });
+  };
+
+  const pos = (e) => { const r = cv.getBoundingClientRect(); return [Math.round(e.clientX - r.left), Math.round(e.clientY - r.top)]; };
+  const norm = (c) => ({ x: Math.min(c.x0, c.x1), y: Math.min(c.y0, c.y1), w: Math.abs(c.x1 - c.x0), h: Math.abs(c.y1 - c.y0) });
+  function hit(x, y) {
+    const ss = displayShapes();
+    for (let i = ss.length - 1; i >= 0; i--) { const s = ss[i]; if (x >= s.x && x <= s.x + s.w && y >= s.y && y <= s.y + s.h) return s; }
+    return null;
+  }
+  const sendMove = (d) => {
+    const m = { type: 'move_shape', opId: uuid(), id: d.id, x: d.x, y: d.y };
+    send(m); d.lastSent = performance.now(); return m;
+  };
+
+  cv.addEventListener('pointerdown', (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    e.preventDefault();
+    try { cv.setPointerCapture(e.pointerId); } catch {}
+    const [x, y] = pos(e);
+    if (tool === 'line') { stroke = [[x, y]]; liveId = rid('l'); liveSent = 0; liveAt = 0; }
+    else {
+      const s = hit(x, y);
+      if (s) { settle = null; dragging = { id: s.id, dx: x - s.x, dy: y - s.y, x: s.x, y: s.y, lastSent: 0, moved: false }; }
+      else { creating = { x0: x, y0: y, x1: x, y1: y }; liveId = rid('r'); liveAt = 0; }
+    }
+    dirty = true;
+  });
+
+  // pointerrawupdate fires as soon as input arrives (not aligned to frames); falls back to pointermove.
+  const MOVE_EVT = 'onpointerrawupdate' in window ? 'pointerrawupdate' : 'pointermove';
+  cv.addEventListener(MOVE_EVT, (e) => {
+    if (!stroke && !dragging && !creating) return;
+    const [x, y] = pos(e);
+    if (stroke) {
+      const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+      for (const ce of (evs.length ? evs : [e])) {
+        const [cx, cy] = pos(ce), last = stroke[stroke.length - 1];
+        if (Math.abs(last[0] - cx) + Math.abs(last[1] - cy) >= 1) stroke.push([cx, cy]);
+      }
+      streamPreview();
+    } else if (dragging) {
+      dragging.x = x - dragging.dx; dragging.y = y - dragging.dy; dragging.moved = true;
+      if (performance.now() - dragging.lastSent >= 4) sendMove(dragging);
+    } else if (creating) { creating.x1 = x; creating.y1 = y; streamPreview(); }
+    dirty = true;
+  });
+
+  function finish(e) {
+    if (stroke) {
+      if (stroke.length === 1) { const p = stroke[0]; stroke.push([p[0] + 1, p[1]]); }
+      if (stroke.length >= 2) send({ type: 'draw_line', opId: uuid(), id: liveId, points: stroke, color: colorEl.value, width: 2 });
+      stroke = null;
+    } else if (dragging) {
+      if (dragging.moved) { const m = sendMove(dragging); settle = { id: m.id, opId: m.opId, x: m.x, y: m.y }; }
+      dragging = null;
+    } else if (creating) {
+      let r = norm(creating);
+      if (r.w < 5 || r.h < 5) r = { x: creating.x0, y: creating.y0, w: 100, h: 60 };
+      send({ type: 'create_shape', opId: uuid(), id: liveId, x: r.x, y: r.y, w: r.w, h: r.h, color: colorEl.value });
+      creating = null;
+    }
+    try { cv.releasePointerCapture(e.pointerId); } catch {}
+    dirty = true;
+  }
+  cv.addEventListener('pointerup', finish);
+  cv.addEventListener('pointercancel', finish);
+
+  connect();
+})();
+</script>
+</body>
+</html>

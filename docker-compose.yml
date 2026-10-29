@@ -1,0 +1,37 @@
+x-node: &node
+  build: .
+  image: whiteboard-node
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 2s
+
+services:
+  node1:
+    <<: *node
+    environment:
+      NODE_ID: node1
+      PORT: 8001
+      PEERS: ws://node2:8002/peer,ws://node3:8003/peer
+    ports: ["8001:8001"]
+    volumes: [data1:/data]
+  node2:
+    <<: *node
+    environment:
+      NODE_ID: node2
+      PORT: 8002
+      PEERS: ws://node1:8001/peer,ws://node3:8003/peer
+    ports: ["8002:8002"]
+    volumes: [data2:/data]
+  node3:
+    <<: *node
+    environment:
+      NODE_ID: node3
+      PORT: 8003
+      PEERS: ws://node1:8001/peer,ws://node2:8002/peer
+    ports: ["8003:8003"]
+    volumes: [data3:/data]
+
+volumes:
+  data1:
+  data2:
+  data3:
