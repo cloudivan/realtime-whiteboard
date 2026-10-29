@@ -8,6 +8,8 @@ Collaborative board (rectangles + freehand lines) served by 3 equal nodes. Any c
 docker compose up --build          # node1:8001, node2:8002, node3:8003
 ```
 
+The nodes use host networking (Linux, e.g. Hetzner). On Docker Desktop for Mac/Windows, enable host networking in Settings → Resources → Network first.
+
 Open http://localhost:8001, http://localhost:8002, http://localhost:8003 in different tabs. Drawing in one tab shows up in all of them.
 
 Load, chaos and convergence test (50 bots, 10 ops/s each, kills `node2` at 60s for 30s):
@@ -20,7 +22,20 @@ node bots.js BOTS=20 DURATION=60 NO_KILL=1        # env vars work too: BOTS=20 n
 Options: `HOST` (localhost), `BOTS` (50), `DURATION` s (180), `KILL_AT` s (60), `KILL_FOR` s (30), `KILL_NODE` (node2), `RATE` ops/s per bot (10), `NO_KILL=1`.
 At the end it checks that all three `/state` bodies have the same sha256, that no created shape or line is missing, that the `ops` count matches the number of unique ops sent, and that each shape's final position equals the max-ts move. It also prints echo and cross-node delivery latency (avg/p50/p99). It exits with code 0 on PASS.
 
+Latency probe (run alongside the bots in another terminal; it measures cross-node delivery without the load generator skewing it): `node probe.js 30`.
+
 Full reset (wipes the persisted logs): `docker compose down -v`.
+
+## Performance
+
+Measured on a 2-vCPU Hetzner VM, with 50 bots at 10 ops/s each running on the same machine. Cross-node delivery: **avg 1.96 ms, p50 1.6 ms, p99 7.9 ms**. The first version, with the same design but naive fan-out, measured avg 32 ms. What made the difference:
+- **Frame once, write everywhere:** each broadcast is encoded as a WebSocket frame once, and the same bytes go to every client socket. Sockets stay corked until the end of the event-loop tick, so many frames share one syscall.
+- **Batched replication:** one link per pair of nodes. Each tick a node pushes all its new ops in one message, and a per-link "sent" pointer means nothing is sent twice.
+- **Host networking:** clients connect straight to the node process. There is no `docker-proxy` copying every byte.
+- **Non-blocking persistence:** the op log is written through an async stream.
+- **Cached snapshot:** a burst of reconnects after a node failure costs one state serialization instead of one per client.
+- Client broadcasts leave out replication-internal fields, and the young-generation GC space is larger (`--max-semi-space-size`).
+
 
 ## Protocol
 
@@ -53,14 +68,14 @@ A shape shows up only after its `create_shape` has arrived.
   │  node1    │◄─────────►│  node2    │◄─────────►│  node3    │
   │  :8001    │           │  :8002    │           │  :8003    │
   └─────┬─────┘◄─────────────────────────────────►└─────┬─────┘
-        │            full mesh: live op push +          │
-        │            version vectors every 500 ms       │
+        │       full mesh: batched live push per tick + │
+        │       version vectors every 500 ms            │
    /data/ops.log           /data/ops.log           /data/ops.log
    (volume data1)          (volume data2)          (volume data3)
 ```
 
-- **Internal replication ports:** nodes talk to each other on ports 9001-9003 (`/peer`), which are only reachable inside the Docker network and are not published to the host. Clients can only reach 8001-8003, and every replicated message is validated before it is applied.
-- **Op flow:** a client sends an op to its node. The node gives it `ts=[hlc, originId]` and a per-origin seq, applies it, appends it to `ops.log`, broadcasts it to its clients and pushes it to its peers right away. Peers apply it and broadcast it to their own clients.
+- **Internal replication ports:** nodes talk to each other on ports 9001-9003 (`/peer`). These are bound to `127.0.0.1` only, so nothing outside the machine can reach them. Clients can only reach 8001-8003, and every replicated message is validated before it is applied.
+- **Op flow:** a client sends an op to its node. The node gives it `ts=[hlc, originId]` and a per-origin seq, applies it, appends it to `ops.log`, broadcasts it to its clients (one encoded frame, corked sockets) and pushes it to its peers at the end of the same event-loop tick, batched. Peers apply it and broadcast it to their own clients.
 - **State:** each shape position is an LWW register keyed by `ts`. Lines are a grow-only set keyed by id. Ops are deduplicated by `opId`.
 - **Anti-entropy:** every 500 ms nodes swap version vectors (`origin → max seq`) and send each other the missing ops for every origin. This includes ops from origins that are offline right now, so any surviving node can repair any other node.
 - **Restart:** a node replays `ops.log`, picks a fresh `originId = NODE_ID-<start time>` (seqs never collide), and catches up through anti-entropy.
@@ -82,7 +97,9 @@ A shape shows up only after its `create_shape` has arrived.
 - При возвращении узел сначала проигрывает лог с диска, затем по anti-entropy (обмен version vectors раз в 500 мс) забирает недостающие операции **любого** origin у **любого** живого пира. Через секунду он полностью догнан.
 
 **Задержка**
-- Операция рассылается сразу, без батчинга, без сжатия и без ожидания кворума: локальным клиентам немедленно, пирам по уже открытому ws.
+- Операция рассылается в том же такте event loop, без сжатия и без ожидания кворума. WebSocket-кадр собирается один раз, и одни и те же байты пишутся во все сокеты. Сокеты «закупорены» до конца такта, поэтому много кадров уходит одним системным вызовом. Пирам за такт уходит одна пачка.
+- Сеть хоста: клиент подключается прямо к процессу узла, без docker-proxy. Лог на диск пишется асинхронно и не блокирует рассылку.
+- Результат на Hetzner при 50 ботах: доставка на другой узел в среднем ~2 мс, p99 ~8 мс.
 - Пиры связаны постоянной полной mesh-сетью, поэтому до любого клиента ровно один межузловой хоп и нет затрат на handshake.
 - Консенсуса и лидера нет (в отличие от Raft/Paxos), поэтому запись никогда не ждёт других узлов. Задержку и eventual consistency тест измеряет как p50/p99 доставки до бота на другом узле.
 

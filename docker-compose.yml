@@ -1,9 +1,13 @@
+# Host networking: each node binds its port directly on the host (no docker-proxy hop),
+# which removes a copy per message and cuts latency. Replication ports 9001-9003 are
+# bound to 127.0.0.1 only, so they are not reachable from outside the machine.
 x-node: &node
   build: .
   image: whiteboard-node
   init: true
   restart: unless-stopped
   stop_grace_period: 2s
+  network_mode: host
 
 services:
   node1:
@@ -11,24 +15,27 @@ services:
     environment:
       NODE_ID: node1
       PORT: 8001
-      PEERS: ws://node2:9002/peer,ws://node3:9003/peer
-    ports: ["8001:8001"]
+      PEER_PORT: 9001
+      PEER_HOST: 127.0.0.1
+      PEERS: ws://127.0.0.1:9002/peer,ws://127.0.0.1:9003/peer
     volumes: [data1:/data]
   node2:
     <<: *node
     environment:
       NODE_ID: node2
       PORT: 8002
-      PEERS: ws://node1:9001/peer,ws://node3:9003/peer
-    ports: ["8002:8002"]
+      PEER_PORT: 9002
+      PEER_HOST: 127.0.0.1
+      PEERS: ws://127.0.0.1:9001/peer,ws://127.0.0.1:9003/peer
     volumes: [data2:/data]
   node3:
     <<: *node
     environment:
       NODE_ID: node3
       PORT: 8003
-      PEERS: ws://node1:9001/peer,ws://node2:9002/peer
-    ports: ["8003:8003"]
+      PEER_PORT: 9003
+      PEER_HOST: 127.0.0.1
+      PEERS: ws://127.0.0.1:9001/peer,ws://127.0.0.1:9002/peer
     volumes: [data3:/data]
 
 volumes:

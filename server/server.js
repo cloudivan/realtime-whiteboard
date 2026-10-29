@@ -9,7 +9,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { WebSocketServer, WebSocket } = require('ws');
+const { WebSocketServer, WebSocket, Sender } = require('ws');
 
 const NODE_ID = process.env.NODE_ID || 'node1';
 const PORT = Number(process.env.PORT || 8001);
@@ -53,6 +53,7 @@ function vv() {
 // Applying is commutative + idempotent, so duplicates of the same opId accepted
 // by two different nodes still converge (both are applied, LWW picks the max ts).
 function apply(op) {
+  stateVersion++;
   const ts = op.ts;
   if (op.type === 'create_shape') {
     let s = shapes.get(op.id);
@@ -83,6 +84,18 @@ function ingest(op) {
   apply(op);
   return true;
 }
+
+// Serialized state cached per version: a burst of reconnects or /state calls costs one build.
+let stateVersion = 0, cacheVersion = -1, cacheStateStr = '', cacheSnapMsg = '';
+function stateStr() {
+  if (cacheVersion !== stateVersion) {
+    cacheStateStr = JSON.stringify(snapshot());
+    cacheSnapMsg = '{"type":"snapshot","state":' + cacheStateStr + '}';
+    cacheVersion = stateVersion;
+  }
+  return cacheStateStr;
+}
+function snapshotMsg() { stateStr(); return cacheSnapMsg; }
 
 function snapshot() {
   const sh = [];
@@ -132,18 +145,10 @@ function normalize(m) {
 }
 
 // ---------- persistence ----------
-let persistBuf = [];
-let persistScheduled = false;
+// Async append stream: writes never block the event loop.
+let logStream = null;
 function persist(str) {
-  persistBuf.push(str);
-  if (!persistScheduled) { persistScheduled = true; setImmediate(flushPersist); }
-}
-function flushPersist() {
-  persistScheduled = false;
-  if (!persistBuf.length) return;
-  const data = persistBuf.join('\n') + '\n';
-  persistBuf = [];
-  try { fs.appendFileSync(LOG_FILE, data); } catch (e) { console.error('persist failed', e.message); }
+  if (logStream) logStream.write(str + '\n');
 }
 function loadLog() {
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
@@ -156,19 +161,84 @@ function loadLog() {
   }
   console.log(`[${NODE_ID}] replayed ${n} ops from disk`);
 }
+function openLog() {
+  logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+  logStream.on('error', e => console.error('persist failed', e.message));
+}
 
 // ---------- networking ----------
 const clients = new Set();
-const peers = new Set();
+const subscribers = new Set(); // incoming peer links: we push ops to these
+const dialed = new Set();      // outgoing peer links: we pull from these (send our vv, receive ops)
 
-function sendAll(set, str) {
-  for (const ws of set) if (ws.readyState === WebSocket.OPEN) ws.send(str);
+// Client broadcast: frame the message once, write the same bytes to every socket.
+// Sockets stay corked until the end of the tick so many frames share one syscall.
+const corked = new Set();
+let uncorkScheduled = false;
+function uncorkAll() {
+  uncorkScheduled = false;
+  for (const s of corked) s.uncork();
+  corked.clear();
+}
+function broadcast(str, except) {
+  if (!clients.size) return;
+  const frame = Buffer.concat(Sender.frame(Buffer.from(str), { fin: true, rsv1: false, opcode: 1, mask: false, readOnly: false }));
+  for (const ws of clients) {
+    if (ws === except || ws.readyState !== WebSocket.OPEN) continue;
+    const sock = ws._socket;
+    if (!corked.has(sock)) { sock.cork(); corked.add(sock); }
+    sock.write(frame);
+  }
+  if (!uncorkScheduled && corked.size) { uncorkScheduled = true; setImmediate(uncorkAll); }
+}
+
+// What clients receive: the op without replication-internal fields.
+function clientStr(op) {
+  const { origin, seq, ...rest } = op;
+  return JSON.stringify(rest);
 }
 
 // New op that was just ingested here (from a client or a peer): fan out locally.
 function publishLocal(op, str) {
-  sendAll(clients, str);
+  broadcast(clientStr(op));
   persist(str);
+}
+
+// Each subscriber link tracks what it has already been sent per origin (ws.sent).
+// A link is a single ordered TCP stream, so sending strictly from that pointer
+// never creates gaps or duplicates; a new link starts again from the peer's vv.
+const WIRE = Symbol("wire");
+function wire(op) {
+  let s = op[WIRE];
+  if (!s) { s = JSON.stringify(op); Object.defineProperty(op, WIRE, { value: s }); }
+  return s;
+}
+
+function sendFrom(ws, from, only) {
+  if (ws.readyState !== WebSocket.OPEN) return 0;
+  const out = [];
+  for (const [o, arr] of logs) {
+    if (only && o !== only) continue;
+    const start = Math.max(from[o] || 0, ws.sent[o] || 0);
+    if (arr.length > start) {
+      const end = Math.min(arr.length, start + MAX_BATCH);
+      for (let i = start; i < end; i++) out.push(wire(arr[i]));
+      ws.sent[o] = end;
+    }
+  }
+  if (out.length) ws.send('{"t":"ops","ops":[' + out.join(',') + ']}');
+  return out.length;
+}
+
+// Live push of our own new ops, batched per tick.
+let pushScheduled = false;
+function schedulePush() {
+  if (pushScheduled) return;
+  pushScheduled = true;
+  setImmediate(() => {
+    pushScheduled = false;
+    for (const ws of subscribers) if (ws.synced) sendFrom(ws, {}, ORIGIN);
+  });
 }
 
 function onClientMessage(ws, data) {
@@ -192,37 +262,24 @@ function handleClientMessage(ws, data) {
   let m;
   try { m = JSON.parse(data); } catch { return; }
   if (m && (m.type === 'get_state' || m.type === 'snapshot')) {
-    ws.send(JSON.stringify({ type: 'snapshot', state: snapshot() }));
+    ws.send(snapshotMsg());
     return;
   }
   // Live drawing preview: relayed to everyone, never stored (not part of /state).
   if (m && m.type === 'preview') {
     const str = cleanPreview(m);
-    for (const c of clients) if (c !== ws && c.readyState === WebSocket.OPEN) c.send(str);
-    for (const p of peers) if (p.outgoing && p.readyState === WebSocket.OPEN) p.send('{"t":"preview","m":' + str + '}');
+    broadcast(str, ws);
+    for (const p of subscribers) if (p.readyState === WebSocket.OPEN) p.send('{"t":"preview","m":' + str + '}');
     return;
   }
   const n = normalize(m);
   if (!n) return;
   const known = opIndex.get(n.opId);
-  if (known) { ws.send(JSON.stringify(known)); return; } // resend after reconnect: just ack
+  if (known) { ws.send(clientStr(known)); return; } // resend after reconnect: just ack
   const op = { ...n, ts: [nextHlc(), ORIGIN], origin: ORIGIN, seq: ++mySeq };
   ingest(op);
-  const str = JSON.stringify(op);
-  sendAll(peers, '{"t":"ops","ops":[' + str + ']}');
-  publishLocal(op, str);
-}
-
-function sendMissing(ws, theirVv) {
-  const out = [];
-  for (const [o, arr] of logs) {
-    const from = theirVv[o] || 0;
-    if (arr.length > from) {
-      const slice = arr.slice(from, from + MAX_BATCH);
-      for (const op of slice) out.push(op);
-    }
-  }
-  if (out.length && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: 'ops', ops: out }));
+  publishLocal(op, wire(op));
+  schedulePush();
 }
 
 const OP_TYPES = new Set(['create_shape', 'move_shape', 'draw_line', 'clear_board']);
@@ -239,41 +296,48 @@ function onPeerMessage(ws, data) {
   if (!m || typeof m !== 'object') return;
   try {
     if (m.t === 'preview') {
-      if (m.m && typeof m.m === 'object') sendAll(clients, cleanPreview(m.m));
+      if (m.m && typeof m.m === 'object') broadcast(cleanPreview(m.m));
     } else if (m.t === 'vv') {
-      sendMissing(ws, m.vv && typeof m.vv === 'object' ? m.vv : {});
+      // From a peer that pulls from us: send what it lacks, then stream live ops to it.
+      ws.synced = true;
+      if (!sendFrom(ws, m.vv && typeof m.vv === 'object' ? m.vv : {}) && ws.readyState === WebSocket.OPEN) ws.send('{"t":"ok"}');
     } else if (m.t === 'ops' && Array.isArray(m.ops)) {
       for (const op of m.ops) {
-        if (validOp(op) && ingest(op)) publishLocal(op, JSON.stringify(op));
+        if (validOp(op) && ingest(op)) publishLocal(op, wire(op));
       }
     }
   } catch (e) { console.error('bad peer message', e.message); }
 }
 
-function setupPeer(ws) {
+function setupPeer(ws, set) {
   ws.lastSeen = Date.now();
-  peers.add(ws);
+  ws.sent = {};
+  set.add(ws);
   ws.on('message', d => onPeerMessage(ws, d));
-  ws.on('close', () => peers.delete(ws));
+  ws.on('close', () => set.delete(ws));
   ws.on('error', () => {});
-  ws.send(JSON.stringify({ t: 'vv', vv: vv() }));
 }
 
 function dialPeer(url) {
   const ws = new WebSocket(url, { perMessageDeflate: false });
-  ws.outgoing = true; // previews go over dialed links only, so each peer gets them once
-  ws.on('open', () => setupPeer(ws));
+  ws.on('open', () => {
+    setupPeer(ws, dialed);
+    ws.send(JSON.stringify({ t: 'vv', vv: vv() }));
+  });
   ws.on('error', () => {});
-  ws.on('close', () => { peers.delete(ws); setTimeout(() => dialPeer(url), 300); });
+  ws.on('close', () => { dialed.delete(ws); setTimeout(() => dialPeer(url), 300); });
 }
 
-// Anti-entropy + peer liveness.
+// Anti-entropy: every pull link re-sends our vv; the peer answers with anything we lack
+// (for all origins, so a node that was down catches up from any survivor). Also liveness.
 setInterval(() => {
   const msg = JSON.stringify({ t: 'vv', vv: vv() });
   const now = Date.now();
-  for (const ws of peers) {
-    if (now - ws.lastSeen > 3000) { ws.terminate(); continue; }
-    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  for (const set of [dialed, subscribers]) {
+    for (const ws of set) {
+      if (now - ws.lastSeen > 3000) { ws.terminate(); continue; }
+      if (set === dialed && ws.readyState === WebSocket.OPEN) ws.send(msg);
+    }
   }
 }, SYNC_MS);
 
@@ -283,10 +347,10 @@ const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   if (url === '/state') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(snapshot()));
+    res.end(stateStr());
   } else if (url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ node: NODE_ID, origin: ORIGIN, clients: clients.size, peers: peers.size, vv: vv() }));
+    res.end(JSON.stringify({ node: NODE_ID, origin: ORIGIN, clients: clients.size, peers: dialed.size + subscribers.size, vv: vv() }));
   } else if (url === '/' || url === '/index.html') {
     fs.readFile(indexHtml, (err, buf) => {
       if (err) { res.writeHead(404); res.end('no client'); return; }
@@ -303,30 +367,34 @@ const wssPeers = new WebSocketServer({ noServer: true, perMessageDeflate: false,
 
 server.on('upgrade', (req, socket, head) => {
   wssClients.handleUpgrade(req, socket, head, ws => {
+    ws._socket.setNoDelay(true);
     clients.add(ws);
     ws.on('message', d => onClientMessage(ws, d));
     ws.on('close', () => clients.delete(ws));
     ws.on('error', () => {});
-    ws.send(JSON.stringify({ type: 'snapshot', state: snapshot() }));
+    ws.send(snapshotMsg());
   });
 });
 
 const peerServer = http.createServer((req, res) => { res.writeHead(404); res.end(); });
 peerServer.on('upgrade', (req, socket, head) => {
-  wssPeers.handleUpgrade(req, socket, head, ws => setupPeer(ws));
+  wssPeers.handleUpgrade(req, socket, head, ws => { ws._socket.setNoDelay(true); setupPeer(ws, subscribers); });
 });
 
 function shutdown() {
-  flushPersist();
+  // Push anything not yet sent to peers, then close clients so they fail over.
+  for (const ws of subscribers) if (ws.synced) sendFrom(ws, {}, ORIGIN);
+  uncorkAll();
   for (const ws of clients) ws.close(1001, 'node shutting down');
-  for (const ws of peers) ws.close(1001);
-  setTimeout(() => process.exit(0), 100);
+  if (logStream) logStream.end();
+  setTimeout(() => process.exit(0), 150);
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 loadLog();
-peerServer.listen(PEER_PORT);
+openLog();
+peerServer.listen(PEER_PORT, process.env.PEER_HOST || '0.0.0.0');
 server.listen(PORT, () => {
   console.log(`[${NODE_ID}] origin=${ORIGIN} listening on ${PORT} (peers on ${PEER_PORT}), peers=${PEERS.join(',')}`);
   PEERS.forEach(dialPeer);
